@@ -1,0 +1,47 @@
+# Multi-timeframe intraday strategy configuration.
+# Bias/structure is analysed on the higher timeframe (htf); entries fire on the
+# lower timeframe (ltf). Tune these per market — the logic is market-agnostic.
+
+# ----- Timeframes -----
+ltf: "5min"        # execution timeframe: "1min" or "5min"
+htf: "1H"          # analysis timeframe: e.g. "15min", "30min", "1H"
+
+# ----- Higher-timeframe bias -----
+htf_ema_fast: 20
+htf_ema_slow: 50
+htf_adx_length: 14
+htf_adx_min: 20.0  # only trade when the HTF is genuinely trending
+
+# ----- Lower-timeframe entry -----
+ltf_ema_fast: 9
+ltf_ema_slow: 21
+ltf_rsi_length: 14
+rsi_long_floor: 40.0
+rsi_long_ceiling: 70.0
+rsi_short_floor: 30.0
+rsi_short_ceiling: 60.0
+pullback_lookback: 3
+breakout_lookback: 10
+use_vwap_filter: true
+volume_ma_length: 20
+volume_mult: 1.0
+
+# ----- Risk management -----
+atr_length: 14
+atr_stop_mult: 1.5
+risk_reward: 2.0
+risk_per_trade: 0.01     # risk 1% of equity per trade
+allow_long: true
+allow_short: true
+
+# ----- Session / circuit breakers (exchange-local time) -----
+session_start: "09:30"
+session_end: "15:55"     # force flat at/after this time
+no_entry_after: "15:30"  # no new trades after this time
+max_trades_per_day: 4
+max_daily_loss: 0.03     # stop trading for the day after a 3% equity drawdown
+
+# ----- Account / costs -----
+initial_equity: 100000.0
+commission_per_trade: 0.0
+slippage_bps: 1.0

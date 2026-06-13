@@ -1,0 +1,6 @@
+numpy>=1.23
+pandas>=1.5
+PyYAML>=6.0
+
+# Optional: live/historical data download (not required to run the backtest demo)
+# yfinance>=0.2
