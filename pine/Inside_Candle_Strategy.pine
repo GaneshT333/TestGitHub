@@ -1,0 +1,244 @@
+//@version=5
+// =============================================================================
+// Inside Candle (Inside Bar) Strategy — HTF detection + 1-minute entry
+// -----------------------------------------------------------------------------
+// Based on the "Inside Candle" strategy:
+//
+//   * An INSIDE candle forms entirely within the previous ("mother") candle's
+//     high-low range:   high < mother_high  AND  low > mother_low
+//   * ENTRY:
+//       - break of the inside candle's HIGH  -> BUY  (long)
+//       - break of the inside candle's LOW   -> SELL (short)
+//   * STOP LOSS:
+//       - long  -> inside candle low  (option: mother candle low)
+//       - short -> inside candle high (option: mother candle high)
+//   * TARGET: minimum 1:2 / 1:3 reward:risk; optional trailing to ride big moves.
+//
+// This implementation detects the inside candle on a HIGHER timeframe and lets
+// you take entries on the chart timeframe — run the chart on 1 minute.
+//
+// Video "edge" rules implemented as filters:
+//   1. Opening counter-trend filter — near the open, only trade in the session's
+//      initial (gap/first-candle) direction; reversals allowed later in the day.
+//   2. New inside candle supersedes the old one (levels are refreshed).
+//   3. Smaller inside candle vs the mother candle is stronger (size-ratio filter).
+//   4. Avoid inside candles with a large body vs the mother candle (body filter).
+//   5. False-breakout protection — optional close-confirmation entry trigger.
+//
+// NOTE: research/education only — not financial advice. Backtest & paper-trade.
+// =============================================================================
+
+strategy("Inside Candle — HTF Detect + 1m Entry",
+     overlay                 = true,
+     initial_capital         = 100000,
+     default_qty_type        = strategy.fixed,
+     default_qty_value       = 1,
+     pyramiding              = 0,
+     commission_type         = strategy.commission.cash_per_order,
+     commission_value        = 0.0,
+     calc_on_every_tick      = false,
+     process_orders_on_close = true)
+
+// -----------------------------------------------------------------------------
+// Inputs
+// -----------------------------------------------------------------------------
+gTF   = "Timeframe"
+htfTF = input.timeframe("15", "Inside-candle detection timeframe", group = gTF,
+     tooltip = "Inside candles are detected here. Run the chart on 1m for entries. The video used 5m — try 5, 15, 30, 60.")
+
+gEntry = "Entry & trigger"
+entryTrigger = input.string("Close beyond level", "Breakout trigger",
+     options = ["Close beyond level", "Wick beyond level"], group = gEntry,
+     tooltip = "Close-beyond confirms the break and avoids many false-breakout traps. Wick-beyond is the raw break of the high/low.")
+allowLong  = input.bool(true, "Allow BUY (high break)",  group = gEntry)
+allowShort = input.bool(true, "Allow SELL (low break)",  group = gEntry)
+
+gFilter = "Pattern quality filters"
+maxSizeRatio = input.float(0.70, "Max inside/mother range ratio", minval = 0.05, maxval = 1.0, step = 0.05, group = gFilter,
+     tooltip = "Smaller inside candle vs mother is stronger. Reject if inside range / mother range exceeds this.")
+useBodyFilter = input.bool(true, "Reject large inside body", group = gFilter)
+maxBodyRatio  = input.float(0.80, "Max inside/mother body ratio", minval = 0.05, maxval = 2.0, step = 0.05, group = gFilter,
+     tooltip = "Avoid inside candles whose body is large vs the mother candle's body.")
+expiryBars = input.int(0, "Cancel setup after N chart bars (0 = until broken)", minval = 0, group = gFilter,
+     tooltip = "Optionally drop an un-triggered setup after this many 1m bars.")
+
+gRisk = "Risk management"
+slSource   = input.string("Inside candle", "Stop-loss level",
+     options = ["Inside candle", "Mother candle"], group = gRisk,
+     tooltip = "Stop at the inside candle's opposite extreme, or the wider mother-candle extreme.")
+riskReward = input.float(3.0, "Reward : Risk target", minval = 0.5, step = 0.5, group = gRisk)
+useTrail   = input.bool(false, "Trail instead of fixed target", group = gRisk,
+     tooltip = "Ride trends: activate a trailing stop instead of taking a fixed R:R target.")
+trailStartR = input.float(1.0, "Trail activates at (R)", minval = 0.1, step = 0.1, group = gRisk)
+trailOffR   = input.float(1.0, "Trail offset (R)",       minval = 0.1, step = 0.1, group = gRisk)
+riskPerTrade= input.float(1.0, "Risk per trade (% equity)", minval = 0.01, step = 0.1, group = gRisk) / 100.0
+
+gSess = "Session / opening filter / circuit breakers"
+useSession   = input.bool(true, "Restrict to session", group = gSess)
+sessWindow   = input.session("0915-1530", "Session window", group = gSess,
+     tooltip = "Exchange time. Indian equities/F&O 0915-1530; US 0930-1600; crypto 0000-2359.")
+openingBlock = input.int(120, "Block counter-trend entries for first N min", minval = 0, group = gSess,
+     tooltip = "Near the open, only trade in the session's initial direction. The video allows reversals only later in the day.")
+noEntryAfter = input.session("1500-1530", "No new entries after (this window)", group = gSess)
+maxTrades    = input.int(5, "Max trades per day", minval = 1, group = gSess)
+maxDailyLoss = input.float(3.0, "Daily loss halt (% equity)", minval = 0.1, group = gSess) / 100.0
+
+gViz = "Visuals"
+showLevels  = input.bool(true, "Draw inside-candle high/low", group = gViz)
+showSignals = input.bool(true, "Show BUY/SELL markers",      group = gViz)
+
+// -----------------------------------------------------------------------------
+// Higher-timeframe inside-candle detection (non-repainting: uses CLOSED bars)
+// -----------------------------------------------------------------------------
+// Everything is computed on the previously CLOSED HTF candle ([1]) relative to
+// its own mother candle ([2]), so values are final and do not repaint.
+insideBarData() =>
+    inside = (high[1] < high[2]) and (low[1] > low[2])
+    ibh    = high[1]
+    ibl    = low[1]
+    mh     = high[2]
+    ml     = low[2]
+    ibody  = math.abs(close[1] - open[1])
+    mbody  = math.abs(close[2] - open[2])
+    [inside ? 1 : 0, ibh, ibl, mh, ml, ibody, mbody]
+
+[insFlag, ibhF, iblF, mhF, mlF, ibodyF, mbodyF] = request.security(syminfo.tickerid, htfTF, insideBarData(), lookahead = barmerge.lookahead_off)
+htfT   = request.security(syminfo.tickerid, htfTF, time, lookahead = barmerge.lookahead_off)
+newHTF = ta.change(htfT) != 0   // true on the first chart bar after an HTF bar closes
+
+// -----------------------------------------------------------------------------
+// Arm / refresh the active inside-candle setup
+// -----------------------------------------------------------------------------
+var float setIBH = na
+var float setIBL = na
+var float setMH  = na
+var float setML  = na
+var bool  armed  = false
+var bool  tookLong  = false
+var bool  tookShort = false
+var int   armedAge  = 0
+
+if armed
+    armedAge += 1
+
+if newHTF and insFlag == 1
+    insideRange = ibhF - iblF
+    motherRange = mhF - mlF
+    sizeOk = motherRange > 0 and (insideRange / motherRange) <= maxSizeRatio
+    bodyOk = not useBodyFilter or (mbodyF > 0 and (ibodyF / mbodyF) <= maxBodyRatio)
+    if sizeOk and bodyOk
+        // A new qualifying inside candle supersedes any older setup.
+        setIBH := ibhF
+        setIBL := iblF
+        setMH  := mhF
+        setML  := mlF
+        armed     := true
+        tookLong  := false
+        tookShort := false
+        armedAge  := 0
+
+// Optional expiry of an un-triggered setup.
+if armed and expiryBars > 0 and armedAge >= expiryBars
+    armed := false
+
+// -----------------------------------------------------------------------------
+// Session, opening-direction & circuit-breaker gating
+// -----------------------------------------------------------------------------
+inSession  = not useSession or not na(time(timeframe.period, sessWindow))
+lateWindow = useSession and not na(time(timeframe.period, noEntryAfter))
+
+var int   tradesToday    = 0
+var float dayStartEquity = strategy.equity
+var int   initialDir     = 0
+var int   minsIntoDay    = 0
+isNewDay = ta.change(time("D")) != 0
+if isNewDay
+    tradesToday    := 0
+    dayStartEquity := strategy.equity
+    prevClose      = close[1]
+    initialDir     := open > prevClose ? 1 : open < prevClose ? -1 : (close > open ? 1 : -1)
+    minsIntoDay    := 0
+else
+    minsIntoDay += 1   // one chart (1m) bar ~ one minute
+
+inOpeningWindow = minsIntoDay < openingBlock
+
+dailyLossHit = (dayStartEquity - strategy.equity) >= maxDailyLoss * dayStartEquity
+tradesLeft   = tradesToday < maxTrades
+canTrade     = inSession and not lateWindow and not dailyLossHit and tradesLeft and strategy.position_size == 0
+
+// -----------------------------------------------------------------------------
+// Breakout detection on the chart (1m) timeframe
+// -----------------------------------------------------------------------------
+closeTrigger = entryTrigger == "Close beyond level"
+brokeHigh = armed and not tookLong  and (closeTrigger ? close > setIBH : high > setIBH)
+brokeLow  = armed and not tookShort and (closeTrigger ? close < setIBL : low  < setIBL)
+
+// Opening counter-trend filter: near the open only trade with the initial direction.
+longDirOk  = not inOpeningWindow or initialDir >=  0
+shortDirOk = not inOpeningWindow or initialDir <=  0
+
+enterLong  = canTrade and allowLong  and brokeHigh and longDirOk
+enterShort = canTrade and allowShort and brokeLow  and shortDirOk
+
+// -----------------------------------------------------------------------------
+// Orders, stops & sizing
+// -----------------------------------------------------------------------------
+qtyFor(riskPerUnit) =>
+    riskCash = strategy.equity * riskPerTrade
+    riskPerUnit > 0 ? math.max(1, math.floor(riskCash / riskPerUnit)) : 1
+
+if enterLong
+    entryPrice = close
+    stopPrice  = slSource == "Mother candle" ? setML : setIBL
+    riskU      = entryPrice - stopPrice
+    if riskU > 0
+        strategy.entry("Long", strategy.long, qty = qtyFor(riskU))
+        if useTrail
+            strategy.exit("L-exit", "Long", stop = stopPrice,
+                 trail_price  = entryPrice + trailStartR * riskU,
+                 trail_offset = trailOffR * riskU / syminfo.mintick)
+        else
+            strategy.exit("L-exit", "Long", stop = stopPrice, limit = entryPrice + riskReward * riskU)
+        tradesToday += 1
+        tookLong := true
+        armed    := false
+
+if enterShort
+    entryPrice = close
+    stopPrice  = slSource == "Mother candle" ? setMH : setIBH
+    riskU      = stopPrice - entryPrice
+    if riskU > 0
+        strategy.entry("Short", strategy.short, qty = qtyFor(riskU))
+        if useTrail
+            strategy.exit("S-exit", "Short", stop = stopPrice,
+                 trail_price  = entryPrice - trailStartR * riskU,
+                 trail_offset = trailOffR * riskU / syminfo.mintick)
+        else
+            strategy.exit("S-exit", "Short", stop = stopPrice, limit = entryPrice - riskReward * riskU)
+        tradesToday += 1
+        tookShort := true
+        armed     := false
+
+// Force flat at the end of the session.
+if useSession and strategy.position_size != 0 and na(time(timeframe.period, sessWindow))
+    strategy.close_all(comment = "EOD flat")
+
+// -----------------------------------------------------------------------------
+// Visuals
+// -----------------------------------------------------------------------------
+plot(showLevels and armed ? setIBH : na, "Inside high", color = color.new(color.green, 0), style = plot.style_linebr)
+plot(showLevels and armed ? setIBL : na, "Inside low",  color = color.new(color.red,   0), style = plot.style_linebr)
+
+plotshape(showSignals and enterLong,  title = "BUY",  style = shape.labelup,
+     location = location.belowbar, color = color.new(color.green, 0),
+     textcolor = color.white, text = "BUY", size = size.small)
+plotshape(showSignals and enterShort, title = "SELL", style = shape.labeldown,
+     location = location.abovebar, color = color.new(color.red, 0),
+     textcolor = color.white, text = "SELL", size = size.small)
+
+// -----------------------------------------------------------------------------
+// Alerts
+// -----------------------------------------------------------------------------
+alertcondition(enterLong,  title = "BUY signal",  message = "Inside-candle BUY  {{ticker}} @ {{close}}")
+alertcondition(enterShort, title = "SELL signal", message = "Inside-candle SELL {{ticker}} @ {{close}}")

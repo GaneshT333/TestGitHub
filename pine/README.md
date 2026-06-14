@@ -1,51 +1,69 @@
-# Pine Script — MTF Intraday (HTF bias + 1‑minute entry)
+# Pine Script — Inside Candle Strategy (HTF detection + 1‑minute entry)
 
-`MTF_Intraday_Strategy.pine` is a TradingView **Pine Script v5 strategy** that
-implements the same approach as the Python framework in this repo:
+`Inside_Candle_Strategy.pine` is a TradingView **Pine Script v5 strategy** that
+implements the **Inside Candle (Inside Bar) strategy** from the source video,
+detecting the pattern on a **higher timeframe** and taking entries on the
+**1‑minute** chart with BUY/SELL signals.
 
-> **Analyse trend + strength on a higher timeframe, then take precise entries on
-> the 1‑minute chart, with buy/sell signals.**
+## The strategy
+
+An **inside candle** forms entirely within the previous ("mother") candle's
+high–low range:
+
+```
+mother high ─────────┐
+                     │   ┌── inside high   ← break UP  = BUY
+   mother candle     │   │  inside candle
+                     │   └── inside low    ← break DOWN = SELL
+mother low  ─────────┘
+```
+
+- **Entry:** break of the inside candle's **high → BUY**, break of its **low → SELL**
+- **Stop loss:** inside candle's low (long) / high (short) — optionally the wider
+  mother‑candle extreme
+- **Target:** minimum **1:2 / 1:3** reward:risk; optional trailing stop to ride
+  big moves
+
+## "Edge" rules from the video (built in as filters)
+
+1. **Opening counter‑trend filter** — near the open, only trade in the session's
+   initial (gap / first‑candle) direction. Reversals are allowed later in the day.
+2. **New inside candle supersedes the old** — levels refresh when a newer
+   qualifying inside candle appears.
+3. **Smaller inside candle is stronger** — `Max inside/mother range ratio`
+   rejects inside candles that are too large relative to the mother.
+4. **Avoid a large inside body** — `Reject large inside body` skips inside
+   candles whose body is big vs the mother candle.
+5. **False‑breakout (trap) protection** — the `Close beyond level` trigger
+   requires a *close* past the high/low instead of a bare wick, filtering many
+   fake breakouts. Switch to `Wick beyond level` for the raw break.
 
 ## How to use
 
-1. Open TradingView → **Pine Editor**.
-2. Paste the contents of `MTF_Intraday_Strategy.pine` and click **Add to chart**.
-3. **Run the chart on the 1‑minute timeframe** (the entry timeframe).
-4. Set the **Higher timeframe (analysis)** input to your bias timeframe
-   (default `15` — try `30` or `60`).
-5. Read results in the **Strategy Tester** tab; tune the inputs per market.
+1. TradingView → **Pine Editor** → paste `Inside_Candle_Strategy.pine` → **Add to chart**.
+2. **Run the chart on the 1‑minute timeframe** (the entry timeframe).
+3. Set **Inside‑candle detection timeframe** to your structure timeframe
+   (default `15`; the video demonstrated `5`).
+4. Tune filters and risk in the settings; review results in the **Strategy Tester**.
+5. Create alerts from the **BUY signal / SELL signal** `alertcondition`s for
+   notifications or webhooks.
 
-## Signal logic
+## Key inputs
 
-**Higher‑timeframe bias** (non‑repainting — uses the last *closed* HTF bar):
-- `EMA fast > EMA slow` and `close > EMA slow` → up; opposite → down
-- `ADX ≥ threshold` confirms a real trend (filters chop)
-- → bias = **LONG / SHORT / FLAT**
+| Group | Input | Meaning |
+|-------|-------|---------|
+| Timeframe | `detection timeframe` | where inside candles are detected (chart stays 1m) |
+| Entry | `Breakout trigger` | close‑confirmed vs raw wick break |
+| Filters | `range ratio`, `body ratio`, `expiry` | pattern‑quality gates |
+| Risk | `SL level`, `Reward:Risk`, `trailing`, `risk per trade` | stops, targets, sizing |
+| Session | `session`, `opening filter`, `no‑entry window`, `max trades`, `daily loss` | intraday guard‑rails |
 
-**1‑minute entry** (only in the bias direction):
-- Trigger: **pullback to the fast EMA then resume**, *or* **breakout** of the
-  recent N‑bar range
-- Confirmations: RSI inside a healthy band, price on the correct side of **VWAP**,
-  and **volume above its average**
+## Non‑repainting note
 
-**Risk:** ATR stop + fixed reward:risk target, position sized to a % of equity,
-session window, daily‑loss halt, max‑trades‑per‑day, and force‑flat at session end.
+Inside candles are read from **closed** higher‑timeframe bars
+(`request.security` on `high[1]/high[2]` etc.), so signals do **not** repaint
+after the fact.
 
-A **BUY**/**SELL** label is plotted at each entry, and matching `alertcondition`s
-let you wire up TradingView alerts/webhooks.
-
-## Mapping to `config.yaml`
-
-The inputs mirror the Python `config.yaml` 1‑for‑1 (HTF EMAs + ADX, LTF EMAs,
-RSI bands, pullback/breakout lookbacks, VWAP/volume filters, ATR stop, reward:risk,
-risk‑per‑trade, session, max trades/day, daily‑loss halt), so a setup tuned in the
-backtester transfers directly to the chart.
-
-## Note on the source video
-
-This script was built from the repo's existing multi‑timeframe spec because the
-linked YouTube video could not be fetched in this environment. If the video
-teaches specific rules (exact indicators, timeframes, or entry/exit conditions),
-share them and the inputs/logic can be matched precisely.
-
-> Research/education only. Not financial advice. Backtest and paper‑trade first.
+> Research/education only. Not financial advice. Backtest and paper‑trade before
+> risking real capital. Inside‑bar breakouts are prone to false breakouts —
+> mind the trap rules from the video.
