@@ -1,0 +1,228 @@
+//@version=5
+// =============================================================================
+// Multi-Timeframe Intraday Strategy  —  HTF bias + 1-minute entry
+// -----------------------------------------------------------------------------
+// Concept (same logic as the Python framework in this repo):
+//   1. Analyse TREND + STRENGTH on a higher timeframe (HTF):
+//        - EMA stack (fast vs slow) -> direction
+//        - ADX >= threshold         -> trend is strong enough to trade
+//      => bias = LONG / SHORT / FLAT
+//   2. Take precise ENTRIES on the chart timeframe (run this on a 1-minute chart):
+//        - Trade ONLY in the direction of the HTF bias (never counter-trend)
+//        - Trigger: pullback-to-EMA-then-resume  OR  micro-structure breakout
+//        - Confirm: RSI band + optional VWAP side filter + volume above average
+//   3. Risk: ATR stop + fixed reward:risk target, % equity position sizing,
+//      session window and intraday circuit breakers.
+//
+// The HTF values are read with a non-repainting pattern (last CLOSED HTF bar),
+// so signals do not repaint after the fact.
+//
+// NOTE: research/education only — not financial advice. Backtest and
+// paper-trade before risking real capital.
+// =============================================================================
+
+strategy("MTF Intraday — HTF Bias + 1m Entry",
+     overlay              = true,
+     initial_capital      = 100000,
+     default_qty_type     = strategy.fixed,
+     default_qty_value    = 1,
+     pyramiding           = 0,
+     commission_type      = strategy.commission.cash_per_order,
+     commission_value     = 0.0,
+     calc_on_every_tick   = false,
+     process_orders_on_close = true)
+
+// -----------------------------------------------------------------------------
+// Inputs
+// -----------------------------------------------------------------------------
+// --- Timeframes ---
+gTF      = "Timeframes"
+htfTF    = input.timeframe("15", "Higher timeframe (analysis)", group = gTF,
+     tooltip = "Trend/structure is analysed here. Run the chart itself on 1m for entries. Try 15, 30, 60.")
+
+// --- Higher-timeframe bias ---
+gHTF     = "Higher-timeframe bias"
+htfEmaFast = input.int(20, "HTF EMA fast", minval = 1, group = gHTF)
+htfEmaSlow = input.int(50, "HTF EMA slow", minval = 2, group = gHTF)
+htfAdxLen  = input.int(14, "HTF ADX length", minval = 1, group = gHTF)
+htfAdxMin  = input.float(20.0, "HTF ADX minimum", minval = 0, group = gHTF,
+     tooltip = "Only trade when the HTF is genuinely trending (filters chop).")
+
+// --- Lower-timeframe entry ---
+gLTF      = "Lower-timeframe entry"
+ltfEmaFast = input.int(9,  "LTF EMA fast", minval = 1, group = gLTF)
+ltfEmaSlow = input.int(21, "LTF EMA slow", minval = 2, group = gLTF)
+rsiLen     = input.int(14, "RSI length", minval = 1, group = gLTF)
+rsiLongFloor   = input.float(40.0, "RSI long floor",   group = gLTF)
+rsiLongCeiling = input.float(70.0, "RSI long ceiling", group = gLTF)
+rsiShortFloor  = input.float(30.0, "RSI short floor",  group = gLTF)
+rsiShortCeiling= input.float(60.0, "RSI short ceiling",group = gLTF)
+pullbackLB = input.int(3,  "Pullback lookback", minval = 1, group = gLTF)
+breakoutLB = input.int(10, "Breakout lookback", minval = 1, group = gLTF)
+useVwap    = input.bool(true, "Use VWAP side filter", group = gLTF)
+volMaLen   = input.int(20, "Volume MA length", minval = 1, group = gLTF)
+volMult    = input.float(1.0, "Volume multiplier", minval = 0, group = gLTF,
+     tooltip = "Require volume >= multiplier * its moving average.")
+
+// --- Risk management ---
+gRisk     = "Risk management"
+atrLen     = input.int(14, "ATR length", minval = 1, group = gRisk)
+atrStopMult= input.float(1.5, "ATR stop multiple", minval = 0.1, group = gRisk)
+riskReward = input.float(2.0, "Reward : Risk", minval = 0.1, group = gRisk)
+riskPerTrade = input.float(1.0, "Risk per trade (% equity)", minval = 0.01, step = 0.1, group = gRisk) / 100.0
+allowLong  = input.bool(true, "Allow longs",  group = gRisk)
+allowShort = input.bool(true, "Allow shorts", group = gRisk)
+
+// --- Session / circuit breakers ---
+gSess     = "Session / circuit breakers"
+useSession  = input.bool(true, "Restrict to session", group = gSess)
+sessWindow  = input.session("0930-1600", "Session window", group = gSess,
+     tooltip = "Exchange time. Widen for futures/FX; use 0000-2359 for crypto.")
+noEntryAfter= input.session("1530-1600", "No new entries after (start of this window)", group = gSess,
+     tooltip = "New entries are blocked once price enters this window (exchange time). Set its start to your cutoff, e.g. 1530-1600.")
+maxTrades   = input.int(4, "Max trades per day", minval = 1, group = gSess)
+maxDailyLoss= input.float(3.0, "Daily loss halt (% equity)", minval = 0.1, group = gSess) / 100.0
+
+// --- Visuals ---
+gViz      = "Visuals"
+showSignals = input.bool(true, "Show buy/sell markers", group = gViz)
+shadeBias   = input.bool(true, "Shade background by HTF bias", group = gViz)
+
+// -----------------------------------------------------------------------------
+// Higher-timeframe bias (non-repainting: uses the last CLOSED HTF bar)
+// -----------------------------------------------------------------------------
+// Compute the bias expression on the HTF, then request it with a 1-bar offset +
+// lookahead_on, the standard idiom that returns the last confirmed HTF value
+// without repainting.
+htfBiasExpr() =>
+    ef  = ta.ema(close, htfEmaFast)
+    es  = ta.ema(close, htfEmaSlow)
+    [_dp, _dm, adxv] = ta.dmi(htfAdxLen, htfAdxLen)
+    trending = adxv >= htfAdxMin
+    up   = (ef > es) and (close > es)
+    down = (ef < es) and (close < es)
+    int b = 0
+    b := trending and up   ?  1 : trending and down ? -1 : 0
+    b
+
+htfBias = request.security(syminfo.tickerid, htfTF, htfBiasExpr()[1], lookahead = barmerge.lookahead_on)
+
+// -----------------------------------------------------------------------------
+// Lower-timeframe (chart) indicators
+// -----------------------------------------------------------------------------
+emaFast = ta.ema(close, ltfEmaFast)
+emaSlow = ta.ema(close, ltfEmaSlow)
+rsiVal  = ta.rsi(close, rsiLen)
+atrVal  = ta.atr(atrLen)
+vwapVal = ta.vwap(hlc3)                       // session VWAP (resets daily)
+volMa   = ta.sma(volume, volMaLen)
+hh      = ta.highest(high, breakoutLB)[1]     // recent range high (excl. current bar)
+ll      = ta.lowest(low,  breakoutLB)[1]      // recent range low  (excl. current bar)
+
+// -----------------------------------------------------------------------------
+// Entry conditions  (mirror of strategy.py::_entry_signals)
+// -----------------------------------------------------------------------------
+rising  = emaFast > emaSlow
+falling = emaFast < emaSlow
+volOk   = volume >= volMult * volMa
+
+// Pullback-and-resume
+pulledBackLong  = ta.lowest(low,  pullbackLB) <= emaFast
+resumeLong      = (close > emaFast) and (close > open)
+pulledBackShort = ta.highest(high, pullbackLB) >= emaFast
+resumeShort     = (close < emaFast) and (close < open)
+
+// Micro-structure breakout
+breakoutLong  = close > hh
+breakoutShort = close < ll
+
+rsiLongOk  = rsiVal >= rsiLongFloor  and rsiVal <= rsiLongCeiling
+rsiShortOk = rsiVal >= rsiShortFloor and rsiVal <= rsiShortCeiling
+
+vwapLongOk  = useVwap ? close > vwapVal : true
+vwapShortOk = useVwap ? close < vwapVal : true
+
+longTrigger  = (pulledBackLong  and resumeLong)  or breakoutLong
+shortTrigger = (pulledBackShort and resumeShort) or breakoutShort
+
+// -----------------------------------------------------------------------------
+// Session & circuit-breaker gating
+// -----------------------------------------------------------------------------
+inSession  = not useSession or not na(time(timeframe.period, sessWindow))
+// Block new entries once we are in the late-session "no entry" window.
+lateWindow = useSession and not na(time(timeframe.period, noEntryAfter))
+
+// Detect the start of a new trading day to reset daily counters.
+var int   tradesToday    = 0
+var float dayStartEquity = strategy.equity
+isNewDay = ta.change(time("D")) != 0
+if isNewDay
+    tradesToday    := 0
+    dayStartEquity := strategy.equity
+
+dailyLossHit = (dayStartEquity - strategy.equity) >= maxDailyLoss * dayStartEquity
+tradesLeft   = tradesToday < maxTrades
+
+canEnter = inSession and not lateWindow and not dailyLossHit and tradesLeft and strategy.position_size == 0
+
+// -----------------------------------------------------------------------------
+// Final signals
+// -----------------------------------------------------------------------------
+longSignal  = allowLong  and htfBias ==  1 and rising  and longTrigger  and rsiLongOk  and vwapLongOk  and volOk
+shortSignal = allowShort and htfBias == -1 and falling and shortTrigger and rsiShortOk and vwapShortOk and volOk
+
+enterLong  = canEnter and longSignal
+enterShort = canEnter and shortSignal
+
+// -----------------------------------------------------------------------------
+// Position sizing from % risk and ATR stop distance
+// -----------------------------------------------------------------------------
+stopDist  = atrStopMult * atrVal
+riskCash  = strategy.equity * riskPerTrade
+qty       = stopDist > 0 ? math.max(1, math.floor(riskCash / stopDist)) : 1
+
+// -----------------------------------------------------------------------------
+// Orders
+// -----------------------------------------------------------------------------
+if enterLong
+    entryPrice = close
+    stopPrice  = entryPrice - stopDist
+    tgtPrice   = entryPrice + riskReward * stopDist
+    strategy.entry("Long", strategy.long, qty = qty)
+    strategy.exit("L-exit", "Long", stop = stopPrice, limit = tgtPrice)
+    tradesToday += 1
+
+if enterShort
+    entryPrice = close
+    stopPrice  = entryPrice + stopDist
+    tgtPrice   = entryPrice - riskReward * stopDist
+    strategy.entry("Short", strategy.short, qty = qty)
+    strategy.exit("S-exit", "Short", stop = stopPrice, limit = tgtPrice)
+    tradesToday += 1
+
+// Force flat at the end of the session.
+if useSession and strategy.position_size != 0 and na(time(timeframe.period, sessWindow))
+    strategy.close_all(comment = "EOD flat")
+
+// -----------------------------------------------------------------------------
+// Visuals
+// -----------------------------------------------------------------------------
+plot(emaFast, "LTF EMA fast", color = color.new(color.aqua, 0), linewidth = 1)
+plot(emaSlow, "LTF EMA slow", color = color.new(color.orange, 0), linewidth = 1)
+plot(useVwap ? vwapVal : na, "VWAP", color = color.new(color.fuchsia, 0))
+
+bgcolor(shadeBias and htfBias ==  1 ? color.new(color.green, 92) : na, title = "HTF bias long")
+bgcolor(shadeBias and htfBias == -1 ? color.new(color.red,   92) : na, title = "HTF bias short")
+
+plotshape(showSignals and enterLong,  title = "BUY",  style = shape.labelup,
+     location = location.belowbar, color = color.new(color.green, 0),
+     textcolor = color.white, text = "BUY", size = size.small)
+plotshape(showSignals and enterShort, title = "SELL", style = shape.labeldown,
+     location = location.abovebar, color = color.new(color.red, 0),
+     textcolor = color.white, text = "SELL", size = size.small)
+
+// -----------------------------------------------------------------------------
+// Alerts
+// -----------------------------------------------------------------------------
+alertcondition(enterLong,  title = "BUY signal",  message = "MTF BUY  {{ticker}} @ {{close}}")
+alertcondition(enterShort, title = "SELL signal", message = "MTF SELL {{ticker}} @ {{close}}")
