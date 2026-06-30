@@ -73,8 +73,7 @@ upDir      = hmaSlp >=  slopeAtrMin and close > hma and diPlus >= diMinus
 downDir    = hmaSlp <= -slopeAtrMin and close < hma and diMinus >  diPlus
 
 // 1 = up, -1 = down, 0 = sideways
-regimeRaw = isTrending and upDir   ?  1 :
-            isTrending and downDir ? -1 : 0
+regimeRaw = isTrending and upDir ? 1 : (isTrending and downDir ? -1 : 0)
 
 // Stabilise: only commit a decision on a confirmed (closed) bar unless the user
 // opts into intrabar reaction.
@@ -101,9 +100,7 @@ var label tag = na
 if showLabel and barstate.islast
     label.delete(tag)
     txt = isUp ? "▲ UPTREND" : isDown ? "▼ DOWNTREND" : "▬ SIDEWAYS"
-    info = txt + "\nADX " + str.tostring(adx, "#.#") +
-           "  | CHOP " + str.tostring(chop, "#.#") +
-           "\nHMA slope " + str.tostring(hmaSlp, "#.##") + " ATR"
+    info = txt + "\nADX " + str.tostring(adx, "#.#") + "  | CHOP " + str.tostring(chop, "#.#") + "\nHMA slope " + str.tostring(hmaSlp, "#.##") + " ATR"
     tag := label.new(bar_index, high, info,
          style=label.style_label_down,
          color=color.new(regCol, 0),
