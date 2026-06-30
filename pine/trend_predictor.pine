@@ -51,7 +51,7 @@ showLines   = input.bool(true,  "Plot HMA / ZLEMA", group=grpV)
 hma = ta.hma(close, hmaLen)
 
 // Zero-Lag EMA: de-lag the source by adding the recent momentum, then EMA it.
-lag    = math.floor((zlemaLen - 1) / 2)
+lag    = int(math.floor((zlemaLen - 1) / 2))
 zlsrc  = close + (close - close[lag])
 zlema  = ta.ema(zlsrc, zlemaLen)
 
@@ -78,7 +78,8 @@ regimeRaw = isTrending and upDir   ?  1 :
 
 // Stabilise: only commit a decision on a confirmed (closed) bar unless the user
 // opts into intrabar reaction.
-regime = useIntrabar ? regimeRaw : (barstate.isconfirmed ? regimeRaw : nz(regime[1], 0))
+var int regime = 0
+regime := useIntrabar ? regimeRaw : (barstate.isconfirmed ? regimeRaw : nz(regime[1], 0))
 
 isUp   = regime ==  1
 isDown = regime == -1
