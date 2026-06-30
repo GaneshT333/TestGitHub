@@ -1,0 +1,126 @@
+//@version=6
+// =============================================================================
+//  Low-Lag Trend Predictor  —  Uptrend / Downtrend / Sideways
+// -----------------------------------------------------------------------------
+//  Classifies the current market regime into one of three states and tries to
+//  do it with as little lag as possible.
+//
+//  Why this is "low-lag":
+//    * Direction comes from a Hull Moving Average (HMA). The HMA is a weighted
+//      construction (WMA of 2*WMA(n/2) - WMA(n)) specifically designed to track
+//      price with far less delay than an EMA/SMA of the same length.
+//    * A Zero-Lag EMA (ZLEMA) gives an early confirmation cross. ZLEMA pre-adds
+//      the recent momentum (de-lagging the input) before smoothing.
+//    * "Strength vs chop" is read from ADX and the Choppiness Index, so a
+//      flat/ranging tape is reported as SIDEWAYS instead of a false trend.
+//
+//  Honest note: no indicator can be truly non-lagging on closed bars — any
+//  smoothing has *some* delay. This minimises it; it does not eliminate it.
+//  Signals are evaluated on bar close (no repaint). Turn on `useIntrabar` if
+//  you want earlier (repainting) reaction during the live bar.
+// =============================================================================
+indicator("Low-Lag Trend Predictor", shorttitle="LL Trend", overlay=true)
+
+// ----------------------------------------------------------------------------- Inputs
+grpD = "Direction (low-lag)"
+hmaLen   = input.int(55, "Hull MA length", minval=2, group=grpD,
+     tooltip="Core direction engine. Lower = faster/noisier, higher = smoother/slower.")
+zlemaLen = input.int(21, "Zero-Lag EMA length", minval=2, group=grpD,
+     tooltip="Fast early-confirmation line. Cross of price vs ZLEMA front-runs the HMA.")
+
+grpS = "Regime filter (trend vs sideways)"
+adxLen      = input.int(14, "ADX/DI length", minval=1, group=grpS)
+adxTrend    = input.float(20.0, "ADX trend threshold", minval=1, group=grpS,
+     tooltip="ADX above this = a real trend exists. Below = likely sideways.")
+chopLen     = input.int(14, "Choppiness length", minval=2, group=grpS)
+chopSideway = input.float(55.0, "Choppiness sideways threshold", minval=1, maxval=100, group=grpS,
+     tooltip="Choppiness Index above this = ranging/sideways market.")
+slopeAtrMin = input.float(0.05, "Min HMA slope (in ATR)", minval=0.0, step=0.01, group=grpS,
+     tooltip="HMA must move at least this many ATRs/bar to count as trending.")
+atrLen      = input.int(14, "ATR length (slope normaliser)", minval=1, group=grpS)
+
+grpV = "Display"
+useIntrabar = input.bool(false, "React intrabar (repaints)", group=grpV,
+     tooltip="ON = decide on the live bar (earlier but can repaint). OFF = decide on bar close (stable).")
+showBg      = input.bool(true,  "Color background", group=grpV)
+showLabel   = input.bool(true,  "Show status label", group=grpV)
+showLines   = input.bool(true,  "Plot HMA / ZLEMA", group=grpV)
+
+// ----------------------------------------------------------------------------- Core series
+// Hull MA — the low-lag direction core.
+hma = ta.hma(close, hmaLen)
+
+// Zero-Lag EMA: de-lag the source by adding the recent momentum, then EMA it.
+lag    = math.floor((zlemaLen - 1) / 2)
+zlsrc  = close + (close - close[lag])
+zlema  = ta.ema(zlsrc, zlemaLen)
+
+// ADX / DI — trend strength.
+[diPlus, diMinus, adx] = ta.dmi(adxLen, adxLen)
+
+// Choppiness Index — high => sideways, low => trending.
+atr1   = ta.atr(1)
+chop   = 100 * math.log10(math.sum(atr1, chopLen) /
+         (ta.highest(high, chopLen) - ta.lowest(low, chopLen))) / math.log10(chopLen)
+
+// Slope of the HMA, normalised by ATR so the threshold is volatility-agnostic.
+atr     = ta.atr(atrLen)
+hmaSlp  = (hma - hma[1]) / (atr == 0 ? syminfo.mintick : atr)
+
+// ----------------------------------------------------------------------------- Classification
+isTrending = adx >= adxTrend and chop <= chopSideway
+upDir      = hmaSlp >=  slopeAtrMin and close > hma and diPlus >= diMinus
+downDir    = hmaSlp <= -slopeAtrMin and close < hma and diMinus >  diPlus
+
+// 1 = up, -1 = down, 0 = sideways
+regimeRaw = isTrending and upDir   ?  1 :
+            isTrending and downDir ? -1 : 0
+
+// Stabilise: only commit a decision on a confirmed (closed) bar unless the user
+// opts into intrabar reaction.
+regime = useIntrabar ? regimeRaw : (barstate.isconfirmed ? regimeRaw : nz(regime[1], 0))
+
+isUp   = regime ==  1
+isDown = regime == -1
+isSide = regime ==  0
+
+// ----------------------------------------------------------------------------- Plotting
+colUp   = color.new(color.teal,   0)
+colDn   = color.new(color.red,    0)
+colSide = color.new(color.gray,   0)
+regCol  = isUp ? colUp : isDown ? colDn : colSide
+
+plot(showLines ? hma   : na, "HMA",   color=regCol, linewidth=3)
+plot(showLines ? zlema : na, "ZLEMA", color=color.new(color.orange, 0), linewidth=1)
+
+bgcolor(showBg ? color.new(regCol, 88) : na)
+
+// Status label pinned to the last bar.
+var label tag = na
+if showLabel and barstate.islast
+    label.delete(tag)
+    txt = isUp ? "▲ UPTREND" : isDown ? "▼ DOWNTREND" : "▬ SIDEWAYS"
+    info = txt + "\nADX " + str.tostring(adx, "#.#") +
+           "  | CHOP " + str.tostring(chop, "#.#") +
+           "\nHMA slope " + str.tostring(hmaSlp, "#.##") + " ATR"
+    tag := label.new(bar_index, high, info,
+         style=label.style_label_down,
+         color=color.new(regCol, 0),
+         textcolor=color.white, size=size.normal)
+
+// ----------------------------------------------------------------------------- Alerts
+// Fire only on a genuine state change (close-confirmed unless intrabar mode).
+changedUp   = isUp   and not isUp[1]
+changedDown = isDown and not isDown[1]
+changedSide = isSide and not isSide[1]
+
+alertcondition(changedUp,   "Trend → UPTREND",   "Regime changed to UPTREND")
+alertcondition(changedDown, "Trend → DOWNTREND", "Regime changed to DOWNTREND")
+alertcondition(changedSide, "Trend → SIDEWAYS",  "Regime changed to SIDEWAYS")
+
+if changedUp
+    alert("Regime changed to UPTREND",   alert.freq_once_per_bar_close)
+if changedDown
+    alert("Regime changed to DOWNTREND", alert.freq_once_per_bar_close)
+if changedSide
+    alert("Regime changed to SIDEWAYS",  alert.freq_once_per_bar_close)
